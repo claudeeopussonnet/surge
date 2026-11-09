@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.26 [服务端]
+#  多协议代理一键部署脚本 v3.5.27 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.26"
+readonly VERSION="3.5.27"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -10501,150 +10501,165 @@ _singbox_ruleset_source_path() {
     echo "$CFG/ruleset-src/${tag}.json"
 }
 
-_build_singbox_geosite_ruleset() {
-    local tag="$1"
-    local source_path=$(_singbox_ruleset_source_path "$tag")
-    local output_path=$(_singbox_ruleset_path "$tag")
-    local roots=""
+# 在子 shell 内清理临时文件和处理中断，不改写交互菜单的 trap。
+_build_singbox_geo_ruleset() (
+    local tag="$1" source_path output_path tmp_source tmp_output status
+    [[ "$tag" =~ ^(geoip|geosite)-[a-zA-Z0-9][a-zA-Z0-9@!._-]*$ ]] || return 1
+    source_path=$(_singbox_ruleset_source_path "$tag")
+    output_path=$(_singbox_ruleset_path "$tag")
+    mkdir -p "$CFG/ruleset" "$CFG/ruleset-src" || return 1
+    tmp_source=$(mktemp "$CFG/ruleset-src/.${tag}.XXXXXX") || return 1
+    tmp_output=""
+    trap 'rm -f "$tmp_source" "$tmp_output"' EXIT
+    trap '_warn "已取消 Sing-box 规则集生成: $tag" >&2; exit 130' INT
+    trap 'exit 143' TERM
+    tmp_output=$(mktemp "$CFG/ruleset/.${tag}.XXXXXX") || return 1
 
-    case "$tag" in
-        geosite-tracker) roots="category-public-tracker category-pt" ;;
-        geosite-*) roots="${tag#geosite-}" ;;
-        *) return 1 ;;
-    esac
-
-    mkdir -p "$CFG/ruleset" "$CFG/ruleset-src"
-
-    python3 - "$source_path" $roots <<'PY'
-import json, sys, urllib.request
+    # curl 限制整次传输；Python 同时限制所有 include 下载的总耗时。
+    # 先完成下载及源数据校验，再编译，任何一步失败都保留原有缓存。
+    python3 - "$tmp_source" "$tag" <<'PY'
+import ipaddress
+import json
+import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 out_path = Path(sys.argv[1])
-roots = sys.argv[2:]
-base = 'https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/{}'
-seen = set()
-full = set()
-suffix = set()
-keyword = set()
-regex = set()
+tag = sys.argv[2]
+deadline = time.monotonic() + 120
 
 
-def fetch(name: str) -> str:
-    with urllib.request.urlopen(base.format(name), timeout=30) as resp:
-        return resp.read().decode('utf-8', 'ignore')
+def fetch(url, name):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError('规则源下载总耗时超过 120 秒')
+    print(f'  ▸ 下载规则源: {name}（单次最多 30 秒，总计最多 120 秒）', file=sys.stderr, flush=True)
+    try:
+        result = subprocess.run(
+            ['curl', '-fsSL', '--connect-timeout', '10', '--max-time', '30', url],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=min(30, remaining), check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'下载规则源超时: {name}') from None
+    if result.returncode:
+        detail = result.stderr.decode('utf-8', 'replace').strip()
+        raise RuntimeError(f'下载规则源失败: {name} (curl {result.returncode}) {detail}')
+    return result.stdout.decode('utf-8', 'strict')
 
 
-def norm_token(token: str) -> str:
-    token = token.strip()
-    if '@' in token:
-        token = token.split('@', 1)[0].strip()
-    if ' ' in token:
-        token = token.split()[0].strip()
-    return token.strip()
-
-
-def load(name: str):
-    if not name or name in seen:
-        return
-    seen.add(name)
-    text = fetch(name)
+def build_geoip(name):
+    text = fetch(f'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/{name}.txt', name)
+    ips = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith('#'):
             continue
-        if '# ' in line:
-            line = line.split('#', 1)[0].strip()
-        line = norm_token(line)
-        if not line:
-            continue
-        if line.startswith('include:'):
-            load(norm_token(line.split(':', 1)[1]))
-        elif line.startswith('full:'):
-            v = norm_token(line.split(':', 1)[1])
-            if v:
-                full.add(v)
-        elif line.startswith('regexp:'):
-            v = line.split(':', 1)[1].strip()
-            if v:
-                regex.add(v)
-        elif line.startswith('keyword:'):
-            v = norm_token(line.split(':', 1)[1])
-            if v:
-                keyword.add(v)
-        elif line.startswith('domain:'):
-            v = norm_token(line.split(':', 1)[1]).lstrip('.')
-            if v:
-                suffix.add(v)
-        elif line.startswith('exclude:'):
-            continue
-        else:
-            v = norm_token(line).lstrip('.')
-            if v:
-                suffix.add(v)
+        ipaddress.ip_network(line, strict=False)
+        ips.append(line)
+    if not ips:
+        raise ValueError(f'GeoIP 规则源为空: {name}')
+    return {'ip_cidr': ips}
 
-for item in roots:
-    load(item)
 
-rule = {}
-if full:
-    rule['domain'] = sorted(full)
-if suffix:
-    rule['domain_suffix'] = sorted(suffix)
-if keyword:
-    rule['domain_keyword'] = sorted(keyword)
-if regex:
-    rule['domain_regex'] = sorted(regex)
+def build_geosite(name):
+    roots = ['category-public-tracker', 'category-pt'] if name == 'tracker' else [name]
+    seen = set()
+    full, suffix, keyword, regex = set(), set(), set(), set()
 
-out = {'version': 3, 'rules': [rule] if rule else []}
-out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2))
+    def norm_token(token):
+        token = token.strip()
+        if '@' in token:
+            token = token.split('@', 1)[0].strip()
+        if ' ' in token:
+            token = token.split()[0].strip()
+        return token.strip()
+
+    def load(name):
+        if not name or name in seen:
+            return
+        # include 只能引用上游 data 下的文件，不接受路径或 URL。
+        if not re.fullmatch(r'[a-zA-Z0-9!._-]+', name):
+            raise ValueError(f'无效的 GeoSite 引用: {name}')
+        seen.add(name)
+        text = fetch(f'https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/{name}', name)
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '# ' in line:
+                line = line.split('#', 1)[0].strip()
+            line = norm_token(line)
+            if not line:
+                continue
+            if line.startswith('include:'):
+                load(norm_token(line.split(':', 1)[1]))
+            elif line.startswith('full:'):
+                value = norm_token(line.split(':', 1)[1])
+                if value:
+                    full.add(value)
+            elif line.startswith('regexp:'):
+                value = line.split(':', 1)[1].strip()
+                if value:
+                    regex.add(value)
+            elif line.startswith('keyword:'):
+                value = norm_token(line.split(':', 1)[1])
+                if value:
+                    keyword.add(value)
+            elif line.startswith('exclude:'):
+                continue
+            else:
+                value = norm_token((line.split(':', 1)[1] if line.startswith('domain:') else line)).lstrip('.')
+                if value:
+                    suffix.add(value)
+
+    for root in roots:
+        load(root)
+    rule = {}
+    for key, values in [('domain', full), ('domain_suffix', suffix),
+                        ('domain_keyword', keyword), ('domain_regex', regex)]:
+        if values:
+            rule[key] = sorted(values)
+    if not rule:
+        raise ValueError(f'GeoSite 规则源为空: {name}')
+    return rule
+
+
+try:
+    kind, name = tag.split('-', 1)
+    rule = build_geoip(name) if kind == 'geoip' else build_geosite(name)
+    out_path.write_text(json.dumps({'version': 3, 'rules': [rule]}, ensure_ascii=False, indent=2))
+except KeyboardInterrupt:
+    sys.exit(130)
+except (OSError, ValueError, RuntimeError) as exc:
+    print(f'  ✗ {exc}', file=sys.stderr)
+    sys.exit(1)
 PY
+    status=$?
+    if [[ "$status" -ne 0 ]]; then
+        [[ "$status" -ne 130 ]] || _warn "已取消 Sing-box 规则集生成: $tag" >&2
+        return "$status"
+    fi
+    _info "编译规则集: $tag" >&2
+    if ! "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$tmp_source" -o "$tmp_output" >/dev/null 2>&1 ||
+       [[ ! -s "$tmp_output" ]]; then
+        _err "编译 Sing-box 规则集失败: $tag" >&2
+        return 1
+    fi
+    chmod 600 "$tmp_source" "$tmp_output" || return 1
+    mv -f "$tmp_source" "$source_path" && mv -f "$tmp_output" "$output_path"
+)
 
-    "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
+_build_singbox_geosite_ruleset() {
+    [[ "$1" == geosite-* ]] || return 1
+    _build_singbox_geo_ruleset "$1"
 }
 
 _build_singbox_geoip_ruleset() {
-    local tag="$1"
-    local source_path=$(_singbox_ruleset_source_path "$tag")
-    local output_path=$(_singbox_ruleset_path "$tag")
-    local name=""
-
-    case "$tag" in
-        geoip-*) name="${tag#geoip-}" ;;
-        *) return 1 ;;
-    esac
-
-    mkdir -p "$CFG/ruleset" "$CFG/ruleset-src"
-
-    python3 - "$source_path" "$name" <<'PY'
-import json, sys, urllib.request
-from pathlib import Path
-
-out_path = Path(sys.argv[1])
-name = sys.argv[2]
-urls = [
-    f'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/{name}.txt',
-]
-text = None
-for url in urls:
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            text = resp.read().decode('utf-8', 'ignore')
-            break
-    except Exception:
-        continue
-if text is None:
-    raise SystemExit(f'failed to fetch geoip source for {name}')
-ips = []
-for raw in text.splitlines():
-    line = raw.strip()
-    if not line or line.startswith('#'):
-        continue
-    ips.append(line)
-out = {'version': 3, 'rules': [{'ip_cidr': ips}] if ips else []}
-out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2))
-PY
-
-    "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
+    [[ "$1" == geoip-* ]] || return 1
+    _build_singbox_geo_ruleset "$1"
 }
 
 _singbox_sukka_ai_cache_valid() {
@@ -10723,7 +10738,7 @@ _ensure_singbox_rulesets_from_routing_rules() {
         local missing_count
         missing_count=$(printf '%s\n' "$missing_tags" | sed '/^$/d' | wc -l | tr -d ' ')
         _info "正在准备 Sing-box 规则集缓存 (${missing_count} 项)..."
-        _warn "首次启用或缓存缺失时，需要下载并编译规则集，可能耗时 30~120 秒，请耐心等待"
+        _warn "首次启用或缓存缺失时需要下载并编译；GeoSite/GeoIP 每项下载总计最多 120 秒，可按 Ctrl+C 取消"
     fi
 
     local tag
@@ -15794,21 +15809,61 @@ db_del_routing_rule() {
     fi
 }
 
-# 数据库：获取分流规则；不指定内核时用于菜单展示全部规则。
-# Mihomo 专属规则不能进入其他内核的规则/出口收集阶段。
-db_get_routing_rules() {
+# 返回原数组下标和规则，避免旧自定义规则 ID 重复时移动错规则。
+_db_routing_rule_entries() {
     local core="${1:-all}" db_file="${2:-$DB_FILE}"
-    [[ ! -f "$db_file" ]] && printf '%s\n' '[]' && return
-    jq --arg core "$core" '. as $db | [.routing_rules[]? |
-        select(.type != "ai-intl" or $core == "all" or $core == "xray") |
-        select(.type != "singbox-ai" or $core == "all" or $core == "singbox") |
-        select(.type != "mihomo-ai" or $core == "all" or $core == "mihomo") |
-        select(.type != "singbox-instagram" or $core == "all" or
+    [[ "$db_file" != /dev/stdin && ! -f "$db_file" ]] && printf '%s\n' '[]' && return
+    jq --arg core "$core" '. as $db | [(.routing_rules // [] | to_entries[]) |
+        select(.value.type != "ai-intl" or $core == "all" or $core == "xray") |
+        select(.value.type != "singbox-ai" or $core == "all" or $core == "singbox") |
+        select(.value.type != "mihomo-ai" or $core == "all" or $core == "mihomo") |
+        select(.value.type != "singbox-instagram" or $core == "all" or
             ($core == "singbox" and
              ([$db.singbox | . // {} | to_entries[] |
                 select(.key == "snell" or .key == "snell-v5" or .key == "snell-shadowtls" or .key == "snell-v5-shadowtls") |
                 .value | if type == "array" then .[] else . end] | length > 0)))
-    ]' "$db_file" 2>/dev/null
+    ] | if $core == "xray" or $core == "singbox" then
+        sort_by(
+            (.value.routing_priority[$core] // 2147483647),
+            (if .value.type != "all" then 0
+             elif .value.ip_version == "ipv6_only" then 1
+             elif .value.ip_version == "ipv4_only" then 2 else 3 end),
+            .key)
+        else . end' "$db_file" 2>/dev/null
+}
+
+# 按内核返回实际分流顺序；全部规则视图保留共享列表的顺序。
+db_get_routing_rules() {
+    local entries
+    entries=$(_db_routing_rule_entries "${1:-all}" "${2:-$DB_FILE}") || return 1
+    jq 'map(.value)' <<<"$entries"
+}
+
+# 序号与目标位置均从 1 开始；仅改变所选内核的优先级。
+db_move_routing_rule() {
+    local core="$1" from="$2" to="${3:-1}" displayed="${4:-}" snapshot entries order count
+    [[ "$core" == xray || "$core" == singbox ]] || return 1
+    [[ "$from" =~ ^[1-9][0-9]{0,8}$ && "$to" =~ ^[1-9][0-9]{0,8}$ ]] || return 1
+    snapshot=$(cat "$DB_FILE") || return 1
+    entries=$(_db_routing_rule_entries "$core" /dev/stdin <<<"$snapshot") || return 1
+    if [[ -n "$displayed" ]]; then
+        jq -e --argjson displayed "$displayed" 'map(.value) == $displayed' <<<"$entries" >/dev/null || return 1
+    fi
+    count=$(jq 'length' <<<"$entries") || return 1
+    (( from <= count && to <= count )) || return 1
+    [[ "$from" != "$to" ]] || return 0
+    order=$(jq --argjson from "$((from-1))" --argjson to "$((to-1))" '
+        map(.key) | .[$from] as $selected | del(.[$from]) |
+        .[:$to] + [$selected] + .[$to:]
+    ' <<<"$entries") || return 1
+    # 加锁后再次校验列表，避免并发增删规则导致数组下标指向其他规则。
+    local expected
+    expected=$(jq '.routing_rules // []' <<<"$snapshot") || return 1
+    _db_apply --arg core "$core" --argjson order "$order" --argjson expected "$expected" '
+        if (.routing_rules // []) != $expected then error("routing rules changed; retry") else
+            reduce range(0; $order | length) as $i (.;
+                .routing_rules[$order[$i]].routing_priority[$core] = $i)
+        end'
 }
 
 # 数据库：检查规则是否存在
@@ -16284,9 +16339,6 @@ gen_xray_routing_rules() {
     [[ -z "$rules" || "$rules" == "[]" ]] && return
     
     local result="[]"
-    local all_ipv6="[]"
-    local all_ipv4="[]"
-    local all_other="[]"
     while IFS= read -r rule; do
         [[ -z "$rule" ]] && continue
         local rule_type=$(echo "$rule" | jq -r '.type')
@@ -16342,11 +16394,7 @@ gen_xray_routing_rules() {
                 rule_json=$(jq -n --arg tag "$tag" --arg key "$tag_key" \
                     '{"type":"field","network":"tcp,udp",($key):$tag}')
             fi
-            case "$ip_version" in
-                ipv6_only) all_ipv6=$(echo "$all_ipv6" | jq --argjson r "$rule_json" '. + [$r]') ;;
-                ipv4_only) all_ipv4=$(echo "$all_ipv4" | jq --argjson r "$rule_json" '. + [$r]') ;;
-                *) all_other=$(echo "$all_other" | jq --argjson r "$rule_json" '. + [$r]') ;;
-            esac
+            result=$(jq --argjson rule "$rule_json" '. + [$rule]' <<<"$result") || return 1
         elif [[ -n "$domains" ]]; then
             # 检测是否是 geosite 规则
             if [[ "$domains" == geosite:* ]]; then
@@ -16425,7 +16473,6 @@ gen_xray_routing_rules() {
         fi
     done < <(echo "$rules" | jq -c '.[]')
     
-    result=$(echo "$result" | jq --argjson v6 "$all_ipv6" --argjson v4 "$all_ipv4" --argjson other "$all_other" '. + $v6 + $v4 + $other')
     [[ "$result" != "[]" ]] && echo "$result"
 }
 
@@ -16485,9 +16532,6 @@ gen_singbox_routing_rules() {
     ]' <<<"$rules") || return 1
     
     local result="[]"
-    local all_ipv6="[]"
-    local all_ipv4="[]"
-    local all_other="[]"
     while IFS= read -r rule; do
         [[ -z "$rule" ]] && continue
         local previous_count
@@ -16542,11 +16586,7 @@ gen_singbox_routing_rules() {
                 rule_json=$(jq -n --arg tag "$tag" \
                     '{"outbound":$tag}')
             fi
-            case "$ip_version" in
-                ipv6_only) all_ipv6=$(echo "$all_ipv6" | jq --argjson r "$rule_json" '. + [$r]') ;;
-                ipv4_only) all_ipv4=$(echo "$all_ipv4" | jq --argjson r "$rule_json" '. + [$r]') ;;
-                *) all_other=$(echo "$all_other" | jq --argjson r "$rule_json" '. + [$r]') ;;
-            esac
+            result=$(jq --argjson rule "$rule_json" '. + [$rule]' <<<"$result") || return 1
         elif [[ "$rule_type" == "singbox-ai" ]]; then
             # 相邻路由表达 OR；ip_version 与规则集相交，不能用全网 ip_cidr 扩张匹配。
             local ai_ip_version=0
@@ -16636,7 +16676,6 @@ gen_singbox_routing_rules() {
         fi
     done < <(echo "$rules" | jq -c '.[]')
     
-    result=$(echo "$result" | jq --argjson v6 "$all_ipv6" --argjson v4 "$all_ipv4" --argjson other "$all_other" '. + $v6 + $v4 + $other')
     [[ "$result" != "[]" ]] && echo "$result"
     return 0
 }
@@ -16767,7 +16806,8 @@ show_routing_status() {
     fi
     
     _line
-    echo -e "  ${C}分流规则${NC}"
+    echo -e "  ${C}分流规则（汇总）${NC}"
+    echo -e "  ${D}各内核的匹配顺序可在“调整规则顺序”中查看${NC}"
     _line
     
     # 显示分流规则 (优化：一次性提取所有字段，避免多次调用 jq)
@@ -17132,6 +17172,7 @@ configure_routing_rules() {
         _item "2" "删除分流规则"
         _item "3" "清空所有规则"
         _item "4" "测试分流效果"
+        _item "5" "调整规则顺序（按内核）"
         _item "0" "返回"
         _line
         
@@ -17174,6 +17215,7 @@ configure_routing_rules() {
                 test_routing
                 _pause
                 ;;
+            5) _reorder_routing_rules ;;
             0) return ;;
         esac
     done
@@ -17184,7 +17226,8 @@ _add_routing_rule() {
     _header
     echo -e "  ${W}添加分流规则${NC}"
     _line
-    echo -e "  ${D}优先级: 直连规则 > 自定义规则 > 预设规则 > 全局规则${NC}"
+    echo -e "  ${D}默认顺序: 直连规则 > 自定义规则 > 预设规则 > 全局规则${NC}"
+    echo -e "  ${D}可按内核调整顺序；手动排序后，新建或覆盖的规则排在已排序规则之后${NC}"
     _line
     
     echo -e "  ${Y}选择规则类型:${NC}"
@@ -17468,6 +17511,133 @@ _del_routing_rule() {
         _ok "已删除规则"
     fi
     _pause
+}
+
+# 调整顺序只重载对应内核；失败时数据库和运行配置一起恢复。
+_apply_routing_rule_order() {
+    local core="$1" from="$2" to="${3:-1}" displayed="${4:-}" config rule_type snapshot
+    local had_config=false was_running=false restart_xray=false
+    case "$core" in
+        xray) config="$CFG/config.json"; rule_type=ai-intl ;;
+        singbox) config="$CFG/singbox.json"; rule_type=singbox-ai ;;
+        *) return 1 ;;
+    esac
+    snapshot=$(mktemp -d "$CFG/.routing-order.XXXXXX") || return 1
+    cp -p "$DB_FILE" "$snapshot/db.json" || { rm -rf "$snapshot"; return 1; }
+    if [[ -f "$config" ]]; then
+        cp -p "$config" "$snapshot/config.json" || { rm -rf "$snapshot"; return 1; }
+        had_config=true
+    fi
+    if [[ "$core" == xray ]] && svc status vless-reality >/dev/null 2>&1; then
+        was_running=true
+    fi
+    if ! db_move_routing_rule "$core" "$from" "$to" "$displayed"; then
+        rm -rf "$snapshot"
+        _err "调整失败，请重新读取规则后再试"
+        return 1
+    fi
+    if _reload_ai_routing_core "$rule_type"; then
+        rm -rf "$snapshot"
+        return 0
+    fi
+
+    # Sing-box 重载器自带服务回滚；Xray 需恢复写入过的新配置及服务。
+    if [[ "$was_running" == true ]] &&
+       { ! cmp -s "$snapshot/config.json" "$config" || ! svc status vless-reality >/dev/null 2>&1; }; then
+        restart_xray=true
+    fi
+    if ! cp -p "$snapshot/db.json" "$DB_FILE"; then
+        _err "数据库恢复失败，备份保留: $snapshot"
+        return 1
+    fi
+    if [[ "$had_config" == true ]]; then
+        cp -p "$snapshot/config.json" "$config" || { _err "配置恢复失败，备份保留: $snapshot"; return 1; }
+    else
+        rm -f "$config" || return 1
+    fi
+    if [[ "$restart_xray" == true ]] && ! svc restart vless-reality; then
+        _err "Xray 服务恢复失败，备份保留: $snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+    _err "调整失败，已恢复原规则顺序和配置"
+    return 1
+}
+
+_reorder_routing_rules() {
+    local core_choice core core_name protocols rules count rule idx choice target
+    local rule_type rule_name domains outbound ip_version ip_mark
+    _header
+    echo -e "  ${W}调整规则顺序${NC}"
+    _line
+    _item "1" "Xray"
+    _item "2" "Sing-box"
+    _item "0" "返回"
+    if [[ -n "$(get_mihomo_protocols)" ]]; then
+        _info "Mihomo 当前仅支持一条 AI 分流规则，无需调整顺序"
+    fi
+    read -rp "  选择内核: " core_choice || return 0
+    case "$core_choice" in
+        1) core=xray; core_name=Xray; protocols=$(get_xray_protocols) ;;
+        2) core=singbox; core_name=Sing-box; protocols=$(get_singbox_protocols) ;;
+        0|"") return 0 ;;
+        *) _err "无效选择"; _pause; return 1 ;;
+    esac
+    [[ -n "$protocols" ]] || { _warn "请先安装 $core_name 协议"; _pause; return 1; }
+
+    while true; do
+        rules=$(db_get_routing_rules "$core") || return 1
+        count=$(jq 'length' <<<"$rules") || return 1
+        _header
+        echo -e "  ${W}${core_name} 分流规则顺序${NC}"
+        _line
+        _info "从上到下匹配，首条命中生效；系统保护和用户专属路由保持原有优先级"
+        _warn "将“所有流量”前移会覆盖其后符合相同 IP 版本的分流规则"
+        idx=1
+        while IFS= read -r rule; do
+            rule_type=$(jq -r '.type' <<<"$rule")
+            rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
+            domains=$(jq -r '.domains // ""' <<<"$rule")
+            [[ "$rule_type" != custom ]] || rule_name="自定义 (${domains:0:60})"
+            [[ "$rule_type" != all ]] || rule_name="所有流量"
+            outbound=$(jq -r '.outbound' <<<"$rule")
+            outbound=$(_get_outbound_display_name "$outbound")
+            ip_version=$(jq -r '.ip_version // "prefer_ipv4"' <<<"$rule")
+            case "$ip_version" in
+                ipv4_only) ip_mark=仅IPv4 ;;
+                ipv6_only) ip_mark=仅IPv6 ;;
+                prefer_ipv4) ip_mark=优先IPv4 ;;
+                prefer_ipv6) ip_mark=优先IPv6 ;;
+                *) ip_mark=ALL ;;
+            esac
+            printf '  %s) %s → %s [%s]\n' "$idx" "$rule_name" "$outbound" "$ip_mark"
+            idx=$((idx+1))
+        done < <(jq -c '.[]' <<<"$rules")
+        if (( count < 2 )); then
+            _info "当前内核不足两条分流规则，无需调整顺序"
+            _pause
+            return 0
+        fi
+        _line
+        read -rp "  选择要移动的规则 (0 返回): " choice || return 0
+        [[ "$choice" != 0 && -n "$choice" ]] || return 0
+        if [[ ! "$choice" =~ ^[1-9][0-9]{0,8}$ ]] || (( choice > count )); then
+            _err "无效规则序号"; _pause; continue
+        fi
+        read -rp "  移动到第几位 [1-$count，默认 1 置顶，0 返回]: " target || return 0
+        target=${target:-1}
+        [[ "$target" != 0 ]] || continue
+        if [[ ! "$target" =~ ^[1-9][0-9]{0,8}$ ]] || (( target > count )); then
+            _err "无效目标位置"; _pause; continue
+        fi
+        if [[ "$choice" == "$target" ]]; then
+            _info "规则已在该位置"; _pause; continue
+        fi
+        _info "更新 $core_name 分流顺序..."
+        _apply_routing_rule_order "$core" "$choice" "$target" "$rules" || { _pause; return 1; }
+        _ok "已将第 $choice 条规则移动到第 $target 位，仅更新 $core_name"
+        _pause
+    done
 }
 
 # AI 预设仅重载其所属核心。

@@ -14,6 +14,10 @@ vless
 
 查看完整配置：进入“协议服务管理 → 查看运行配置文件”，选择 Xray、Sing-box 或 Mihomo。脚本按服务进程的启动参数查找配置，完整输出磁盘文件；服务停止时明确标注默认配置。显示内容包含原始凭据，磁盘文件也可能与进程已经载入的配置不同。
 
+调整已启用规则的顺序：进入 **分流管理 → 配置分流规则 → 5（调整规则顺序）**，选择 Xray 或 Sing-box。列表按该内核的实际分流顺序显示，选择规则后直接回车可置顶，也可输入目标位置；从上到下匹配，首条命中生效。同一条共享规则在两个内核中的顺序独立保存，只重载所选内核，更新失败恢复原顺序和配置，已停止的服务保持停止。
+
+未手动排序时保留默认顺序；手动排序后，新建或覆盖的规则排在已排序规则之后，可再次调整位置。GeoSite/GeoIP 等由同一规则生成的匹配项整体移动。“所有流量”也可以前移，会覆盖其后符合相同 IP 版本的分流规则。此处排序作用于分流规则之间，系统保护、Sing-box 嗅探和用户专属路由保留原有优先级。Mihomo 当前仅支持一条 AI 分流规则，无需排序。
+
 ## 脚本更新渠道
 
 在主菜单选择“检查脚本更新”后，可选择：
@@ -96,7 +100,7 @@ VLESS_TEST_MIHOMO_BIN=/path/to/mihomo bash tests/test-mieru.sh
 - 官方版继续使用独立的 `vless-snell-v6` 服务和 `/etc/vless-reality/snell-v6.conf`，保留原有 DNS 选择。默认使用官方 `v6.0.0` 正式版下载链接（[官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)），已核对 amd64/aarch64 安装包与 RC2 的 SHA-256 一致；GitHub 镜像未同步时也会使用正式版。
 - Surge 订阅中的 Snell v6 节点名称包含实现和端口，客户端 `mode` 与服务端一致；TFO 选择只控制客户端参数。Sing-box 节点变更先校验候选配置，重启/监听检查失败则回滚数据库、配置及服务状态；分流更新失败保留原运行配置。存在 Snell 入站时，核心更新拒绝降级至 v1.14.0 以下。
 - Snell v4/v5 仅管理 `.singbox` 中的记录，ShadowTLS 的 Snell 后端仅绑定回环地址。旧 Mihomo／独立版 v4/v5 的安装、管理和自动迁移支持已移除；仍使用这些部署时，请先用保留迁移能力的旧版脚本完成迁移，再升级。本次代码清理不会自动删除服务器上的旧文件、服务或数据库记录。
-- WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。GeoSite/GeoIP 首次使用需要从 GitHub 下载规则库，之后每 24 小时更新。
+- WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。Sing-box 的 GeoSite/GeoIP 首次使用或缓存缺失时从 GitHub 下载并编译，之后复用本地缓存。下载会显示当前规则源，连接超时 10 秒、单次传输最多 30 秒，每项规则集的全部源下载合计最多 120 秒；超时、下载或编译失败保留已有缓存及原 Sing-box 运行配置。按 Ctrl+C 取消会清理临时文件，不再显示 Python traceback。
 - Instagram/INS 分流使用 `singbox-instagram`，沿用 [Yuu-rules 域名列表](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)，仅匹配 Snell v4/v5（含 ShadowTLS）入站。规则列表缓存 24 小时，更新失败时使用已有缓存；不会扩大到 HY2/TUIC/AnyTLS 或 Snell v6。旧 `mihomo-instagram` 规则键已停止支持，升级前请删除旧规则并重新添加 `singbox-instagram`，即使节点已经迁到 Sing-box 也需要处理。
 - AI 分流分为 `GeoSite-AI-Xray专属`（原 `ai-intl`，仅 Xray）与 `Sukka-AI-Sing-Box专属`（`singbox-ai`，仅 Sing-box，有 Sing-box 协议时显示 `s` 选项）。Sukka 分别使用 [non_ip](https://ruleset.skk.moe/sing-box/non_ip/ai.json) 和 [ip](https://ruleset.skk.moe/sing-box/ip/ai.json) 两份完整规则集，共用所选出口；IPv4/IPv6 限制与规则集匹配条件相交。源文件缓存到 `/etc/vless-reality/ruleset-src/`，独立编译到 `ruleset/`，配置重建时刷新超过 24 小时的缓存；更新失败使用有效旧缓存，无有效缓存则配置生成失败。添加或删除 AI 规则仅重载对应核心。
 - Sing-box 服务端在 `route.rules` 首位统一添加 `{"action":"sniff"}`，从 HTTP Host、TLS SNI 或 QUIC 嗅探域名后执行分流，覆盖所有共享入站；客户端无需修改，不改写原始目标地址。
@@ -119,6 +123,10 @@ bash tests/test-singbox-snell-v45.sh
 bash tests/test-singbox-instagram.sh
 # AI 核心/出口隔离、完整源编译、缓存刷新回退与菜单/重载隔离
 bash tests/test-singbox-ai.sh
+# GeoSite/GeoIP 下载超时、源校验、编译失败保护和 Ctrl+C 清理（离线）
+bash tests/test-singbox-geo-rulesets.sh
+# 可选：使用真实核心编译本地 GeoSite/GeoIP 测试数据
+VLESS_TEST_SINGBOX_BIN=/usr/bin/sing-box bash tests/test-singbox-geo-rulesets.sh
 # 可选：使用本机核心真实编译 AI 规则集并校验配置（不启动服务）
 VLESS_TEST_SINGBOX_BIN=/usr/bin/sing-box bash tests/test-singbox-ai.sh
 # 脚本自身更新、校验与失败恢复
@@ -127,6 +135,10 @@ bash tests/test-script-update.sh
 bash tests/test-runtime-config.sh
 # 服务重启顺序、配置失败保护、Sing-box 回滚、暂停恢复及菜单输入中断
 bash tests/test-service-restart.sh
+# 分内核排序、置顶/指定位置、生成顺序、重载隔离与失败回滚
+bash tests/test-routing-order.sh
+# 可选：使用真实 Sing-box 校验排序后的候选配置（不启动服务）
+VLESS_TEST_SINGBOX_BIN=/usr/bin/sing-box bash tests/test-routing-order.sh
 # 可选：VLESS 使用已有 Sing-box 1.14+ 执行真实配置校验（不启动监听）
 VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-vless.sh
 # 可选：已有 Sing-box 1.14+ 的真实配置校验及回环 TCP/UDP 测试（需要 Python 3）
